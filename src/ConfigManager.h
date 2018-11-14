@@ -17,9 +17,9 @@
 #include <functional>
 #include <list>
 #include "ArduinoJson.h"
+#include <stdint.h>
 
-#define WIFI_OFFSET 2
-#define CONFIG_OFFSET 98
+#define CONFIG_OFFSET 132		// sizeof(wifiDetails) + sizeof(magicHeaderT)
 
 #if defined(ARDUINO_ARCH_ESP8266) //ESP8266
     using WebServer = ESP8266WebServer;
@@ -34,9 +34,22 @@ enum ParameterMode { get, set, both};
  */
 class BaseParameter {
 public:
-    virtual ParameterMode getMode() = 0;
-    virtual void fromJson(JsonObject *json) = 0;
-    virtual void toJson(JsonObject *json) = 0;
+  BaseParameter(const char *name, ParameterMode mode = both) {
+    this->name = name;
+    this->mode = mode;
+  }
+
+  ParameterMode getMode() {
+    return this->mode;
+  }
+
+  virtual void fromJson(JsonObject *json) = 0;
+  virtual void toJson(JsonObject *json) = 0;
+
+  protected:
+  	const char *name;
+  	ParameterMode mode;
+
 };
 
 /**
@@ -45,36 +58,36 @@ public:
 template<typename T>
 class ConfigParameter : public BaseParameter {
 public:
-    ConfigParameter(const char *name, T *ptr, ParameterMode mode = both, std::function<void(const char*)> cb = NULL) {
-        this->name = name;
-        this->ptr = ptr;
-        this->cb = cb;
-        this->mode = mode;
-    }
+  ConfigParameter(const char *name, T *ptr, ParameterMode mode = both, std::function<void(const char*, const T*, const T*)> cb = NULL) :
+			BaseParameter(name, mode) {
+		this->ptr = ptr;
+		this->cb = cb;
+	}
 
-    ParameterMode getMode() {
-        return this->mode;
-    }
+  void fromJson(JsonObject *json) {
+		if (json->containsKey(name) && json->is<T>(name)) {
 
-    void fromJson(JsonObject *json) {
-        if (json->containsKey(name) && json->is<T>(name)) {
-            *ptr = json->get<T>(name);
-        }
-    }
+			T newValue = json->get<T>(name);
 
-    void toJson(JsonObject *json) {
-        json->set(name, *ptr);
+			if (*ptr != newValue) {
+				if (cb) {
+					cb(name, ptr, &newValue);
+				}
+				*ptr = newValue;
+			}
+		}
+	}
 
-        if (cb) {
-            cb(name);
-        }
+  void toJson(JsonObject *json) {
+		json->set<T>(name, *ptr);
+    if (cb) {
+        cb(name, ptr, ptr);
     }
+	}
 
 private:
-    const char *name;
     T *ptr;
-    std::function<void(const char*)> cb;
-    ParameterMode mode;
+    std::function<void(const char* name, const T *oldValue, const T *newValue)> cb;
 };
 
 /**
@@ -82,35 +95,34 @@ private:
  */
 class ConfigStringParameter : public BaseParameter {
 public:
-    ConfigStringParameter(const char *name, char *ptr, size_t length, ParameterMode mode = both) {
-        this->name = name;
-        this->ptr = ptr;
-        this->length = length;
-        this->mode = mode;
-    }
+  ConfigStringParameter(const char *name, char *ptr, size_t length, ParameterMode mode = both,
+    std::function<void(const char*, const char*, const char*)> cb = NULL) : BaseParameter(name, mode) {
+		this->ptr = ptr;
+		this->length = length;
+		this->cb = cb;
+	}
 
-    ParameterMode getMode() {
-        return this->mode;
-    }
+  void fromJson(JsonObject *json) {
+		if (json->containsKey(name) && json->is<char *>(name)) {
+			const char * newValue = json->get<const char *>(name);
+			if (strcmp(ptr, newValue) != 0) {
+				if (cb) {
+					cb(name, ptr, newValue);
+				}
+				memset(ptr, 0, length);
+				strncpy(ptr, newValue, min(strlen(newValue), length-1));
+			}
+		}
+	}
 
-    void fromJson(JsonObject *json) {
-        if (json->containsKey(name) && json->is<char *>(name)) {
-            const char * value = json->get<const char *>(name);
-
-            memset(ptr,'\n',length);
-            strncpy(ptr, const_cast<char*>(value), length - 1);
-        }
-    }
-
-    void toJson(JsonObject *json) {
-        json->set(name, ptr);
-    }
+  void toJson(JsonObject *json) {
+      json->set(name, ptr);
+  }
 
 private:
-    const char *name;
     char *ptr;
     size_t length;
-    ParameterMode mode;
+    std::function<void(const char* name, const char* oldValue, const char* newValue)> cb;
 };
 
 /**
@@ -132,29 +144,27 @@ public:
     void loop();
 
     template<typename T>
-    void begin(T &config) {
+    void begin(T &config, const uint32_t *hostnamePostfix = NULL) {
         this->config = &config;
         this->configSize = sizeof(T);
+        //EEPROM.begin(CONFIG_OFFSET + this->configSize);
+    		EEPROM.begin(512);
 
-        EEPROM.begin(CONFIG_OFFSET + this->configSize);
-
-        setup();
+    		setup(hostnamePostfix);
     }
+
+    void setPrintCallback(std::function<void(void*)> callback) {
+  		printCallback = callback;
+  	}
 
     template<typename T>
-    void addParameter(const char *name, T *variable) {
-        parameters.push_back(new ConfigParameter<T>(name, variable));
+    void addParameter(const char *name, T *variable, ParameterMode mode = both, std::function<void(const char*, const T*, const T*)> cb = NULL) {
+  		parameters.push_back(new ConfigParameter<T>(name, variable, both, cb));
     }
-    template<typename T>
-    void addParameter(const char *name, T *variable, ParameterMode mode) {
-        parameters.push_back(new ConfigParameter<T>(name, variable, mode));
-    }
-    void addParameter(const char *name, char *variable, size_t size) {
-        parameters.push_back(new ConfigStringParameter(name, variable, size));
-    }
-    void addParameter(const char *name, char *variable, size_t size, ParameterMode mode) {
-        parameters.push_back(new ConfigStringParameter(name, variable, size, mode));
-    }
+
+  	void addParameter(const char *name, char *variable, size_t size, ParameterMode mode = both, std::function<void(const char*, const char*, const char*)> cb = NULL) {
+  		parameters.push_back(new ConfigStringParameter(name, variable, size, mode, cb));
+  	}
     void save();
 
 private:
@@ -164,7 +174,7 @@ private:
 
     char *apName = (char *)"Thing";
     char *apPassword = NULL;
-    char *apFilename = (char *)"/index.html";
+  	char *apFilename = (char *)"/index.html";
     int apTimeout = 0;
     unsigned long apStart = 0;
 
@@ -178,6 +188,8 @@ private:
     std::function<void(WebServer*)> apCallback;
     std::function<void(WebServer*)> apiCallback;
 
+    std::function<void(void *)> printCallback;
+
     JsonObject &decodeJson(String jsonString);
 
     void handleAPGet();
@@ -187,14 +199,13 @@ private:
     void handleNotFound();
 
     bool wifiConnected();
-    void setup();
+    void setup(const uint32_t *hostnamePostfix = NULL);
     void startAP();
     void startApi();
 
     void readConfig();
     void writeConfig();
-    boolean isIp(String str);
-    String toStringIP(IPAddress ip);
+    JsonObject& getConfigJSON();
 };
 
 #endif /* __CONFIGMANAGER_H__ */
